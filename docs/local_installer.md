@@ -173,6 +173,21 @@ While it waits for a rollout, `ax` reads the status of the rollout's pods every 
 Error: waiting for ax-system/deployment/ax-server rollout: timed out after 3m0s: pod ax-server-..., container ax-server: ImagePullBackOff: Back-off pulling image "...": ... 403 Forbidden
 ```
 
+#### A Substrate component that is stuck
+
+A component of Agent Substrate can keep running but stop working, and stay that way until it is restarted ([#697](https://github.com/google/ax/issues/697)). On a cluster that has Substrate already, `ax local start` restarts such a component of the Substrate control plane before it goes on:
+
+```text
+==> Installing Agent Substrate v1.0.0 (local profile)...
+    ate-system/deployment/atenet-router is stuck: pod atenet-router-..., container envoy has been running but not ready for 16h0m0s. Restarting it...
+```
+
+It does not restart Substrate's database, snapshot store, or workers, and `ax install` restarts nothing. If one of those is stuck, the error names it and the command to run:
+
+```text
+Error: waiting for ate-system/daemonset/atelet rollout: timed out after 4m0s: pod atelet-..., container atelet: running but not ready; to restart it, run: kubectl --context ax-local -n ate-system rollout restart daemonset/atelet
+```
+
 ---
 
 ## Step 2b: Or Use AX Studio (`ax studio`)

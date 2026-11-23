@@ -56,6 +56,45 @@ var expectedTrustBundles = []string{
 	"postgres.podcert.ate.dev:identity:primary-bundle",
 }
 
+// stuckThreshold is how long a container must have been running, in a pod
+// that is not ready, before Bootstrap restarts its Deployment. Healthy Agent
+// Substrate containers were ready within 11 seconds of starting in testing.
+const stuckThreshold = 30 * time.Second
+
+// restartableDeployments are the Deployments, as "<namespace>/<name>", that
+// Bootstrap restarts when a pod of theirs is stuck (restartStuckDeployments).
+// Their pods carry the label app=<name>.
+//
+// Bootstrap never restarts statefulset/postgres (the Control API's
+// database), deployment/rustfs (the snapshot store), daemonset/atelet (it
+// runs the actors of its node), or the worker pool deployment/ax-workers
+// (its pods are the sandboxes of the users' tasks).
+var restartableDeployments = map[string]bool{
+	NamespacePodCert + "/podcertificate-controller": true,
+	NamespaceAteSystem + "/ate-api-server":          true,
+	NamespaceAteSystem + "/ate-idp-server":          true,
+	NamespaceAteSystem + "/ate-controller":          true,
+	NamespaceAteSystem + "/atenet-router":           true,
+	NamespaceAteSystem + "/atenet-egress":           true,
+	NamespaceAteSystem + "/k8s-credential-provider": true,
+}
+
+// healthSelectors select the pods that alreadyHealthy requires to be Ready,
+// besides postgres-0: the pods of every workload Bootstrap waits for. A
+// workload that is missing here is not looked at on a cluster that has Agent
+// Substrate already, so a stuck pod of it would be reported healthy.
+var healthSelectors = []struct{ ns, sel string }{
+	{NamespacePodCert, "app=podcertificate-controller"},
+	{NamespaceAteSystem, "app=ate-api-server"},
+	{NamespaceAteSystem, "app=ate-idp-server"},
+	{NamespaceAteSystem, "app=ate-controller"},
+	{NamespaceAteSystem, "app=atenet-router"},
+	{NamespaceAteSystem, "app=atenet-egress"},
+	{NamespaceAteSystem, "app=k8s-credential-provider"},
+	{NamespaceAteSystem, "app=atelet"},
+	{NamespaceWorkers, "ate.dev/worker-pool=ax-workers"},
+}
+
 // BootstrapOptions configures local Agent Substrate installation.
 type BootstrapOptions struct {
 	KubeContext    string
@@ -165,6 +204,10 @@ func Bootstrap(ctx context.Context, opts BootstrapOptions) error {
 	}
 
 	fmt.Fprintf(out, "==> Installing Agent Substrate %s (local profile)...\n", version)
+
+	// Applying manifests that did not change creates no new pod, so a pod
+	// that is stuck unready would stay, and the waits below would time out.
+	k.restartStuckDeployments(ctx, time.Now())
 
 	// 1. Namespaces & CRDs.
 	for _, ns := range []string{NamespacePodCert, NamespaceAteSystem, NamespaceWorkers} {
@@ -682,7 +725,7 @@ func (k *kubeHelper) discoverOIDCIssuer(ctx context.Context) string {
 // the pods of target are waiting for, and a timeout error quotes it
 // (executil.WaitRollout).
 func (k *kubeHelper) rolloutStatus(ctx context.Context, namespace, target string, timeout time.Duration) error {
-	return executil.WaitRollout(ctx, k.runner, executil.RolloutOptions{
+	err := executil.WaitRollout(ctx, k.runner, executil.RolloutOptions{
 		Kubectl:     k.kubectl,
 		KubeContext: k.context,
 		Namespace:   namespace,
@@ -690,6 +733,130 @@ func (k *kubeHelper) rolloutStatus(ctx context.Context, namespace, target string
 		Timeout:     timeout,
 		Out:         k.out,
 	})
+	// The error ends with the kubectl command that restarts the workload
+	// when a container is running but not ready. Running `ax local start`
+	// again restarts it too (restartStuckDeployments), but only a Deployment
+	// in restartableDeployments.
+	name, isDeployment := strings.CutPrefix(target, "deployment/")
+	if err != nil && isDeployment && restartableDeployments[namespace+"/"+name] && strings.Contains(err.Error(), executil.RestartHint) {
+		return fmt.Errorf("%w, or run `ax local start` again", err)
+	}
+	return err
+}
+
+// restartStuckDeployments runs `kubectl rollout restart` on each Deployment
+// in restartableDeployments that has a stuck pod (stuckContainer), and prints
+// what it restarts. Kubernetes does not repair such a pod itself: the
+// container's process is alive, and the pod still matches its Deployment
+// (https://github.com/google/ax/issues/697). It only starts the restart; the
+// rollout waits of Bootstrap wait for the new pods. Errors are not returned:
+// those waits report a pod that is still unready.
+func (k *kubeHelper) restartStuckDeployments(ctx context.Context, now time.Time) {
+	out := k.out
+	if out == nil {
+		out = io.Discard
+	}
+	restarted := map[string]bool{}
+	for _, ns := range []string{NamespacePodCert, NamespaceAteSystem} {
+		res, err := k.run(ctx, nil, "-n", ns, "get", "pods", "-o", "json")
+		if err != nil {
+			continue
+		}
+		var list struct {
+			Items []stuckPod `json:"items"`
+		}
+		if err := json.Unmarshal([]byte(res.Stdout), &list); err != nil {
+			continue
+		}
+		for _, pod := range list.Items {
+			name := pod.Metadata.Labels["app"]
+			if !restartableDeployments[ns+"/"+name] || restarted[ns+"/"+name] {
+				continue
+			}
+			container, unready, ok := stuckContainer(pod, now)
+			if !ok {
+				continue
+			}
+			restarted[ns+"/"+name] = true
+			fmt.Fprintf(out, "    %s/deployment/%s is stuck: pod %s, container %s has been running but not ready for %s. Restarting it...\n",
+				ns, name, pod.Metadata.Name, container, unready.Round(time.Second))
+			if _, err := k.run(ctx, nil, "-n", ns, "rollout", "restart", "deployment/"+name); err != nil {
+				fmt.Fprintf(out, "    restarting %s/deployment/%s: %v\n", ns, name, err)
+			}
+		}
+	}
+}
+
+// stuckPod is the part of a Kubernetes Pod that stuckContainer reads.
+type stuckPod struct {
+	Metadata struct {
+		Name              string            `json:"name"`
+		Labels            map[string]string `json:"labels"`
+		DeletionTimestamp *time.Time        `json:"deletionTimestamp"`
+	} `json:"metadata"`
+	Status struct {
+		Phase      string `json:"phase"`
+		Conditions []struct {
+			Type               string    `json:"type"`
+			Status             string    `json:"status"`
+			LastTransitionTime time.Time `json:"lastTransitionTime"`
+		} `json:"conditions"`
+		ContainerStatuses []struct {
+			Name  string `json:"name"`
+			Ready bool   `json:"ready"`
+			State struct {
+				Running *struct {
+					StartedAt time.Time `json:"startedAt"`
+				} `json:"running"`
+			} `json:"state"`
+		} `json:"containerStatuses"`
+	} `json:"status"`
+}
+
+// stuckContainer reports whether pod has a stuck container: one whose process
+// runs but that never becomes ready. Kubernetes neither restarts such a
+// container nor replaces its pod.
+//
+// A container is stuck when all of these hold:
+//   - the pod is in phase Running and is not being deleted;
+//   - the container is running and not ready;
+//   - the container has been running for at least stuckThreshold;
+//   - the pod has been unready for at least stuckThreshold.
+//
+// It returns the name of the first such container and how long it has been
+// stuck: the time since it started or since the pod became unready, whichever
+// is later.
+func stuckContainer(pod stuckPod, now time.Time) (container string, unready time.Duration, ok bool) {
+	// Skip a pod that is going away or has not started.
+	if pod.Metadata.DeletionTimestamp != nil || pod.Status.Phase != "Running" {
+		return "", 0, false
+	}
+	// Since when the pod's containers have not all been ready.
+	var podUnreadySince time.Time
+	for _, c := range pod.Status.Conditions {
+		if c.Type == "ContainersReady" && c.Status == "False" {
+			podUnreadySince = c.LastTransitionTime
+		}
+	}
+	// The pod is ready.
+	if podUnreadySince.IsZero() {
+		return "", 0, false
+	}
+	for _, c := range pod.Status.ContainerStatuses {
+		// Skip a container that is ready, or is not running (waiting or exited).
+		if c.Ready || c.State.Running == nil {
+			continue
+		}
+		// Count from the later of the two times.
+		since := c.State.Running.StartedAt
+		if podUnreadySince.After(since) {
+			since = podUnreadySince
+		}
+		if d := now.Sub(since); d >= stuckThreshold {
+			return c.Name, d, true
+		}
+	}
+	return "", 0, false
 }
 
 func (k *kubeHelper) waitCRDsEstablished(ctx context.Context) error {
@@ -764,11 +931,7 @@ func (k *kubeHelper) alreadyHealthy(ctx context.Context, wantVersion string, wan
 	if _, err := k.run(ctx, nil, "-n", NamespaceAteSystem, "wait", "--for=condition=Ready", "pod/postgres-0", "--timeout=90s"); err != nil {
 		return false
 	}
-	for _, selector := range []struct{ ns, sel string }{
-		{NamespaceAteSystem, "app=ate-api-server"},
-		{NamespaceAteSystem, "app=atenet-router"},
-		{NamespaceWorkers, "ate.dev/worker-pool=ax-workers"},
-	} {
+	for _, selector := range healthSelectors {
 		if _, err := k.run(ctx, nil, "-n", selector.ns, "wait", "--for=condition=Ready", "pod", "-l", selector.sel, "--timeout=90s"); err != nil {
 			return false
 		}

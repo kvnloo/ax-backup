@@ -163,6 +163,18 @@ instead. No mocking library is in `go.mod`.
   `status.snapshot` unset or `SNAPSHOT_STORAGE_STATE_PENDING`; `isTagCompleted`
   (`internal/controller/workspace.go`) requires `SNAPSHOT_STORAGE_STATE_COMPLETED`
   (populated by `internal/substrate/substratetest/server.go` in tests).
+- Envoy sidecars stay unready after a restart of only the container next to
+  them (Substrate `v1.0.0`, google/ax#697). On SIGTERM the `atenet-router`
+  container of `atenet-router`, and `ext-proc` of `atenet-egress`, fail
+  Envoy's health check over its admin API (`cmd/atenet/internal/router/envoydrain.go`
+  in Substrate). When the kubelet restarts only that container, nothing sets
+  the health check back (`POST /healthcheck/ok` does), the `envoy` container
+  has no liveness probe, and the pod stays unready. `ax local start` restarts
+  a Deployment in `restartableDeployments` that has such a pod
+  (`restartStuckDeployments` in `internal/install/substrate/bootstrap.go`),
+  but only after `alreadyHealthy` found the cluster unhealthy, so a workload
+  must be in `healthSelectors` for that to happen. It never restarts
+  Postgres, `rustfs`, `atelet`, or the worker pool.
 - Snapshot storage: Actor templates created by AX leave `SnapshotConfig.StorageLocation`
   empty by default so Substrate uses its cluster-wide `--snapshot-location`. Specifying a custom
   snapshot bucket (`snapshotsBucket` in `BuildActorTemplate`) can only be used when the
