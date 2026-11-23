@@ -193,6 +193,7 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 	// template yet) can be retried; an already-created task that hit a later
 	// transient ResumeTask error is rejected without touching the actor.
 	existing, err := s.getStoredTask(ctx, atespace, taskName)
+	previous := "" // the stored phase; "" is no record
 	if err == nil {
 		if existing.GetStatus().GetState() != v1alpha1.TaskState_TASK_STATE_QUEUED ||
 			existing.GetStatus().GetAteTemplate().GetName() != "" ||
@@ -201,6 +202,7 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 			return nil, status.Errorf(codes.FailedPrecondition, "task %s/%s already exists and is immutable", atespace, taskName)
 		}
 		task = existing
+		previous = taskPhase(existing)
 	}
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, status.Errorf(codes.Internal, "checking existing task: %v", err)
@@ -268,20 +270,19 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 	// The task is Queued until its actor exists.
 	task.Status.State = v1alpha1.TaskState_TASK_STATE_QUEUED
 
-	if err := s.saveTask(ctx, task); err != nil {
+	w, err := s.saveTask(ctx, task, previous)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "saving task: %v", err)
 	}
+	w.emit(ctx, "")
 
 	// New tasks start suspended.
 	if err := s.taskManager.Suspend(ctx, task, workspace, gateway); err != nil {
-		return nil, s.recordFailure(ctx, task, "provisioning", err)
+		return nil, s.recordFailure(ctx, task, w.phase, "provisioning", err)
 	}
-	if err := s.clearStoredTaskState(ctx, task); err != nil {
+	if err := s.clearStoredTaskState(ctx, task, w.phase); err != nil {
 		return nil, err
 	}
-
-	// Report the actor as it is now, as GetTask would.
-	s.applyActor(ctx, task)
 	return task, nil
 }
 
@@ -329,13 +330,16 @@ func (s *Server) DeleteTask(ctx context.Context, req *v1alpha1.DeleteTaskRequest
 	defer unlock()
 
 	// Mark the task with delete_time while actor cleanup is in progress.
+	previous := taskPhase(task)
 	if task.Metadata == nil {
 		task.Metadata = &v1alpha1.ObjectMeta{Atespace: atespace, Name: req.Name}
 	}
 	task.Metadata.DeleteTime = timestamppb.Now()
-	if err := s.saveTask(ctx, task); err != nil {
+	w, err := s.saveTask(ctx, task, previous)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "updating task delete_time: %v", err)
 	}
+	w.emit(ctx, "")
 
 	if err := s.deleteTask(ctx, task); err != nil {
 		return nil, err
@@ -355,6 +359,7 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 	}
 	defer unlock()
 
+	previous := taskPhase(task)
 	if task.Status == nil {
 		task.Status = &v1alpha1.TaskStatus{}
 	}
@@ -369,12 +374,9 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 	if err := s.taskManager.Suspend(ctx, task, ws, gw); err != nil {
 		return nil, substrateError(err, "suspending task on substrate")
 	}
-	if err := s.clearStoredTaskState(ctx, task); err != nil {
+	if err := s.clearStoredTaskState(ctx, task, previous); err != nil {
 		return nil, err
 	}
-
-	// Report the actor as it is now, as GetTask would.
-	s.applyActor(ctx, task)
 	return task, nil
 }
 
@@ -390,6 +392,7 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 	}
 	defer unlock()
 
+	previous := taskPhase(task)
 	if task.Status == nil {
 		task.Status = &v1alpha1.TaskStatus{}
 	}
@@ -403,14 +406,11 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 		return nil, err
 	}
 	if err := s.taskManager.Resume(ctx, task, ws, gw); err != nil {
-		return nil, s.recordFailure(ctx, task, "resuming", err)
+		return nil, s.recordFailure(ctx, task, previous, "resuming", err)
 	}
-	if err := s.clearStoredTaskState(ctx, task); err != nil {
+	if err := s.clearStoredTaskState(ctx, task, previous); err != nil {
 		return nil, err
 	}
-
-	// Report the actor as it is now, as GetTask would.
-	s.applyActor(ctx, task)
 	return task, nil
 }
 
@@ -423,32 +423,41 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 //     state, and drops a Ready condition stored by recordFailure.
 //   - Persists the updated task or status, returning a gRPC Internal status
 //     error if the store write fails.
-func (s *Server) clearStoredTaskState(ctx context.Context, task *v1alpha1.Task) error {
-	atespace, taskName := task.GetMetadata().GetAtespace(), task.GetMetadata().GetName()
+//   - Fills in the actor-owned status from Substrate, as GetTask would, and
+//     emits TaskStateChanged with the actor's UID. This is the only write that
+//     can make a task Provisioned, so the one GetActor call serves the
+//     response and the event.
+//
+// previous is the task's stored phase before the write.
+func (s *Server) clearStoredTaskState(ctx context.Context, task *v1alpha1.Task, previous string) error {
 	if task.Status == nil {
 		task.Status = &v1alpha1.TaskStatus{}
 	}
 	task.Status.State = v1alpha1.TaskState_TASK_STATE_UNSPECIFIED
 	task.Status = storedStatus(task.Status)
+	var (
+		w   taskWrite
+		err error
+	)
 	if task.GetMetadata().GetDeleteTime() != nil {
 		task.Metadata.DeleteTime = nil
-		if err := s.saveTask(ctx, task); err != nil {
+		if w, err = s.saveTask(ctx, task, previous); err != nil {
 			return status.Errorf(codes.Internal, "clearing task delete_time: %v", err)
 		}
-		return nil
-	}
-	if err := s.updateTask(ctx, atespace, taskName, task.Status); err != nil {
+	} else if w, err = s.updateTask(ctx, task, previous); err != nil {
 		return status.Errorf(codes.Internal, "updating task status: %v", err)
 	}
+	s.applyActor(ctx, task)
+	w.emit(ctx, task.GetStatus().GetActorUid())
 	return nil
 }
 
 // recordFailure stores the status of a task that could not be provisioned or
 // resumed: state Queued if err is a transient Substrate error, which a retry
 // may fix, and Unspecified otherwise. The Ready condition is stored either way,
-// so that it says why while the task has no actor. It returns the gRPC error
-// for action.
-func (s *Server) recordFailure(ctx context.Context, task *v1alpha1.Task, action string, err error) error {
+// so that it says why while the task has no actor. previous is the task's
+// stored phase before the write. It returns the gRPC error for action.
+func (s *Server) recordFailure(ctx context.Context, task *v1alpha1.Task, previous, action string, err error) error {
 	atespace, name := task.GetMetadata().GetAtespace(), task.GetMetadata().GetName()
 	slog.Error(action+" task on substrate failed", "atespace", atespace, "task", name, "error", err)
 	state := v1alpha1.TaskState_TASK_STATE_UNSPECIFIED
@@ -459,8 +468,11 @@ func (s *Server) recordFailure(ctx context.Context, task *v1alpha1.Task, action 
 		task.Status = &v1alpha1.TaskStatus{}
 	}
 	task.Status.State = state
-	if uerr := s.updateFailedTask(ctx, task); uerr != nil {
+	w, uerr := s.updateFailedTask(ctx, task, previous)
+	if uerr != nil {
 		slog.Error("recording task failure", "atespace", atespace, "task", name, "state", state, "error", uerr)
+	} else {
+		w.emit(ctx, "")
 	}
 	return substrateError(err, action+" task on substrate")
 }
@@ -544,28 +556,45 @@ func (s *Server) listTasks(ctx context.Context, atespace string, limit, offset i
 	return tasks, nil
 }
 
-// saveTask stores task without its Substrate-owned status. task is not modified.
-func (s *Server) saveTask(ctx context.Context, task *v1alpha1.Task) error {
+// saveTask stores task without its Substrate-owned status. task is not
+// modified. The caller holds the task's lock and gives the task's stored phase
+// before the write ("" if there is no record); the caller emits the returned
+// taskWrite.
+func (s *Server) saveTask(ctx context.Context, task *v1alpha1.Task, previous string) (taskWrite, error) {
 	stored := proto.Clone(task).(*v1alpha1.Task)
 	stored.Status = storedStatus(task.Status)
-	return s.store.SaveTask(ctx, stored)
+	if err := s.store.SaveTask(ctx, stored); err != nil {
+		return taskWrite{}, err
+	}
+	return newTaskWrite(stored, previous, taskPhase(stored)), nil
 }
 
-// updateTask stores a task's status without its Substrate-owned parts. st is
-// not modified.
-func (s *Server) updateTask(ctx context.Context, atespace, name string, st *v1alpha1.TaskStatus) error {
-	return s.store.UpdateTaskStatus(ctx, atespace, name, storedStatus(st))
+// updateTask stores the status of task without its Substrate-owned parts.
+// task is not modified, and its metadata must match the stored metadata. The
+// caller holds the task's lock and gives the task's stored phase before the
+// write; the caller emits the returned taskWrite.
+func (s *Server) updateTask(ctx context.Context, task *v1alpha1.Task, previous string) (taskWrite, error) {
+	atespace, name := taskKey(task)
+	stored := storedStatus(task.Status)
+	if err := s.store.UpdateTaskStatus(ctx, atespace, name, stored); err != nil {
+		return taskWrite{}, err
+	}
+	return newTaskWrite(task, previous, taskPhase(&v1alpha1.Task{Metadata: task.GetMetadata(), Status: stored})), nil
 }
 
 // updateFailedTask stores the status of a task that could not be provisioned
 // or resumed as updateTask does, but keeps its Ready condition, which says why.
 // task is not modified.
-func (s *Server) updateFailedTask(ctx context.Context, task *v1alpha1.Task) error {
+func (s *Server) updateFailedTask(ctx context.Context, task *v1alpha1.Task, previous string) (taskWrite, error) {
+	atespace, name := taskKey(task)
 	st := storedStatus(task.Status)
 	if ready := readyCondition(task); ready != nil && !v1alpha1.IsAXTaskState(st.State) {
 		st.Conditions = append(st.Conditions, proto.Clone(ready).(*v1alpha1.Condition))
 	}
-	return s.store.UpdateTaskStatus(ctx, task.GetMetadata().GetAtespace(), task.GetMetadata().GetName(), st)
+	if err := s.store.UpdateTaskStatus(ctx, atespace, name, st); err != nil {
+		return taskWrite{}, err
+	}
+	return newTaskWrite(task, previous, taskPhase(&v1alpha1.Task{Metadata: task.GetMetadata(), Status: st})), nil
 }
 
 // storedStatus returns the part of a task's status that AX owns and stores. The
@@ -594,7 +623,8 @@ func storedStatus(st *v1alpha1.TaskStatus) *v1alpha1.TaskStatus {
 }
 
 // deleteTask removes a task's actor and templates from Substrate, then its
-// record from the store. It returns a gRPC status error.
+// record from the store, and emits TaskStateChanged for the deletion. The
+// caller holds the task's lock. It returns a gRPC status error.
 func (s *Server) deleteTask(ctx context.Context, task *v1alpha1.Task) error {
 	atespace := task.GetMetadata().GetAtespace()
 	name := task.GetMetadata().GetName()
@@ -613,6 +643,8 @@ func (s *Server) deleteTask(ctx context.Context, task *v1alpha1.Task) error {
 	if err := s.store.DeleteTask(ctx, atespace, name); err != nil {
 		return status.Errorf(codes.Internal, "deleting task record: %v", err)
 	}
+	// The caller stored task with delete_time, so its phase is Terminating.
+	newTaskWrite(task, taskPhase(task), PhaseDeleted).emit(ctx, "")
 	return nil
 }
 

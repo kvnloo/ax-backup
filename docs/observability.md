@@ -89,6 +89,32 @@ OTLP event records are batched, so a slow collector never delays the task
 operation that emits them. Records still queued when ax-server exits
 ungracefully are lost, unless `console` also wrote them to stdout.
 
+### `ax.task.state_changed`
+
+ax-server emits this event after each task write that changes the task's
+phase. It writes and emits under the task's lock, so a task's records are in
+write order. The timestamp is the time of the write. Delivery is at most once.
+
+| Attribute | Value |
+|---|---|
+| `ax.task.name`, `ate.atespace`, `ax.task.id` | The task's name, atespace, and `metadata.uid`. |
+| `ax.task.phase`, `ax.task.previous_phase` | A phase below. No previous phase on creation. |
+| `ate.actor.uid` | With `Provisioned` only, if ax-server can read the actor. |
+
+| Phase | Meaning |
+|---|---|
+| `Queued` | No actor yet, or the last `CreateTask` or `ResumeTask` failed with a transient error. In the second case, the actor can exist. |
+| `Provisioned` | The actor owns the live state (`Running`, `Suspended`, ...), which Substrate reports in `ate.actor.state_changed`. |
+| `Failed` | `CreateTask` or `ResumeTask` failed with a permanent error. The `Ready` condition gives the reason. The actor can exist. |
+| `Terminating` | `DeleteTask` started. A failed delete stays here until a retry, `SuspendTask`, or `ResumeTask` succeeds. |
+| `Deleted` | The actor and the task record are deleted. |
+
+For cost, use the Substrate actor records. Join them on `ate.actor.uid`, or
+on `ate.atespace` and `ate.actor.name` (the task's name) from the task's
+first record to its `Deleted` record. ax-server does not store the actor UID,
+so it emits nothing when `SuspendTask` or `ResumeTask` replaces a missing
+actor.
+
 ## Metrics
 
 Each instrument keeps at most 2000 attribute sets per collection (the SDK
