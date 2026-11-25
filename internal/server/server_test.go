@@ -400,6 +400,9 @@ func TestCreate_RejectsInvalidNames(t *testing.T) {
 		if _, err := srv.CreateGateway(ctx, &v1alpha1.CreateGatewayRequest{Gateway: &v1alpha1.Gateway{Metadata: meta}}); status.Code(err) != codes.InvalidArgument {
 			t.Errorf("CreateGateway(%v): got %v, want InvalidArgument", meta, err)
 		}
+		if _, err := srv.UpdateGateway(ctx, &v1alpha1.UpdateGatewayRequest{Gateway: &v1alpha1.Gateway{Metadata: meta}}); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("UpdateGateway(%v): got %v, want InvalidArgument", meta, err)
+		}
 		if _, err := srv.UpdateModel(ctx, &v1alpha1.UpdateModelRequest{Model: &v1alpha1.Model{Metadata: meta}}); status.Code(err) != codes.InvalidArgument {
 			t.Errorf("UpdateModel(%v): got %v, want InvalidArgument", meta, err)
 		}
